@@ -1,4 +1,4 @@
-// server.js - Using MP3 conversion for better Whisper API compatibility
+// server.js - Optimized for WAV audio handling
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -61,156 +61,109 @@ const server = http.createServer((req, res) => {
       }
       
       try {
-        // Combine with previous audio if it exists
-        let combinedBuffer;
-        if (previousAudioBuffer) {
-          console.log(`Combining with previous audio (${previousAudioBufferSize} bytes)`);
-          combinedBuffer = Buffer.concat([previousAudioBuffer, currentBuffer]);
-          console.log(`Combined audio size: ${combinedBuffer.length} bytes`);
-        } else {
-          combinedBuffer = currentBuffer;
-        }
-        
-        // Save audio to file with timestamp to ensure uniqueness
+        // Generate unique filenames
         const timestamp = Date.now();
         const randomString = Math.random().toString(36).substring(2, 8);
-        const webmFile = `audio_${timestamp}_${randomString}.webm`;
-        const mp3File = `audio_${timestamp}_${randomString}.mp3`;
+        const audioFile = `audio_${timestamp}_${randomString}`;
+        const wavFile = `${audioFile}.wav`;
+        const mp3File = `${audioFile}.mp3`;
         
-        console.log(`Saving audio to temporary file: ${webmFile}`);
-        fs.writeFileSync(webmFile, combinedBuffer);
+        // Check audio format by reading first few bytes
+        const headerBuffer = currentBuffer.slice(0, Math.min(12, currentBuffer.length));
+        const isWav = headerBuffer.includes('RIFF') && headerBuffer.includes('WAVE');
+        const isWebm = headerBuffer.includes('webm');
+        const isMp3 = headerBuffer[0] === 0xFF && (headerBuffer[1] & 0xE0) === 0xE0;
         
-        // Check file exists and has content
-        const stats = fs.statSync(webmFile);
-        console.log(`Temporary WebM file size: ${stats.size} bytes`);
+        console.log(`Audio format detection: WAV=${isWav}, WebM=${isWebm}, MP3=${isMp3}`);
         
-        // Convert WebM to MP3 using ffmpeg (this improves compatibility with Whisper)
-        console.log('Converting WebM to MP3...');
-        try {
-          await convertToMp3(webmFile, mp3File);
-          console.log('Conversion successful');
+        // Save the received audio to file
+        fs.writeFileSync(wavFile, currentBuffer);
+        console.log(`Saved audio to temporary file: ${wavFile}`);
+        
+        // STEP 1: Try direct transcription with the file as-is
+        console.log('Sending audio directly to OpenAI API...');
+        let transcript = await transcribeWithCurl(wavFile);
+        console.log(`Direct transcription result: "${transcript}"`);
+        
+        // If direct transcription worked, we're done
+        if (transcript && transcript.trim() !== '') {
+          // Send successful response
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            success: true, 
+            transcript: transcript
+          }));
           
-          // Check if MP3 file exists and has content
-          if (fs.existsSync(mp3File)) {
-            const mp3Stats = fs.statSync(mp3File);
-            console.log(`MP3 file size: ${mp3Stats.size} bytes`);
+          // Clean up and return early
+          cleanupFiles([wavFile]);
+          
+          // Reset buffers
+          previousAudioBuffer = null;
+          previousAudioBufferSize = 0;
+          consecutiveEmptyResponses = 0;
+          
+          return;
+        }
+        
+        // STEP 2: If direct transcription failed and it's not a WAV file, try converting to MP3
+        if (!isWav) {
+          console.log('Direct transcription failed, trying conversion to MP3...');
+          try {
+            await convertToMp3(wavFile, mp3File);
+            console.log('Conversion to MP3 successful');
             
-            if (mp3Stats.size > 0) {
-              // Transcribe using curl
-              console.log('Sending MP3 to OpenAI API using curl...');
-              const transcript = await transcribeWithCurl(mp3File);
-              console.log(`Transcription result: "${transcript}"`);
+            transcript = await transcribeWithCurl(mp3File);
+            console.log(`MP3 transcription result: "${transcript}"`);
+            
+            if (transcript && transcript.trim() !== '') {
+              // Send successful response
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ 
+                success: true, 
+                transcript: transcript
+              }));
               
-              // Handle transcript results
-              if (transcript && transcript.trim() !== '') {
-                // If we got a valid transcript, clear the buffer
-                previousAudioBuffer = null;
-                previousAudioBufferSize = 0;
-                consecutiveEmptyResponses = 0;
-                
-                // Send successful response
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                  success: true, 
-                  transcript: transcript
-                }));
-              } else {
-                // No transcript received, store the current audio for next time
-                consecutiveEmptyResponses++;
-                console.log(`Empty response count: ${consecutiveEmptyResponses}`);
-                
-                if (consecutiveEmptyResponses >= MAX_EMPTY_RESPONSES) {
-                  // Too many empty responses, reset the buffer
-                  console.log(`Too many empty responses (${consecutiveEmptyResponses}), resetting buffer`);
-                  previousAudioBuffer = null;
-                  previousAudioBufferSize = 0;
-                  consecutiveEmptyResponses = 0;
-                } else if (combinedBuffer.length < MAX_BUFFER_SIZE) {
-                  previousAudioBuffer = combinedBuffer;
-                  previousAudioBufferSize = combinedBuffer.length;
-                  console.log(`No transcript received, storing audio for next chunk (${previousAudioBufferSize} bytes)`);
-                } else {
-                  // Buffer too large, reset it
-                  previousAudioBuffer = null;
-                  previousAudioBufferSize = 0;
-                  console.log('Buffer too large, resetting');
-                }
-                
-                // Send empty response
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                  success: true, 
-                  transcript: ''
-                }));
-              }
-            } else {
-              throw new Error('MP3 conversion resulted in empty file');
-            }
-          } else {
-            throw new Error('MP3 file not created');
-          }
-        } catch (conversionError) {
-          console.error('Conversion error:', conversionError);
-          console.log('Trying WebM file directly...');
-          
-          // Transcribe WebM directly as fallback
-          const transcript = await transcribeWithCurl(webmFile);
-          console.log(`Transcription result from WebM: "${transcript}"`);
-          
-          if (transcript && transcript.trim() !== '') {
-            // If we got a valid transcript, clear the buffer
-            previousAudioBuffer = null;
-            previousAudioBufferSize = 0;
-            consecutiveEmptyResponses = 0;
-            
-            // Send successful response
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-              success: true, 
-              transcript: transcript
-            }));
-          } else {
-            // Handle empty transcription like above
-            consecutiveEmptyResponses++;
-            console.log(`Empty response count: ${consecutiveEmptyResponses}`);
-            
-            if (consecutiveEmptyResponses >= MAX_EMPTY_RESPONSES) {
+              // Clean up and return early
+              cleanupFiles([wavFile, mp3File]);
+              
+              // Reset buffers
               previousAudioBuffer = null;
               previousAudioBufferSize = 0;
               consecutiveEmptyResponses = 0;
-              console.log(`Too many empty responses (${consecutiveEmptyResponses}), resetting buffer`);
-            } else if (combinedBuffer.length < MAX_BUFFER_SIZE) {
-              previousAudioBuffer = combinedBuffer;
-              previousAudioBufferSize = combinedBuffer.length;
-              console.log(`No transcript received, storing audio for next chunk (${previousAudioBufferSize} bytes)`);
-            } else {
-              previousAudioBuffer = null;
-              previousAudioBufferSize = 0;
-              console.log('Buffer too large, resetting');
+              
+              return;
             }
-            
-            // Send empty response
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-              success: true, 
-              transcript: ''
-            }));
+          } catch (conversionError) {
+            console.error('MP3 conversion error:', conversionError);
           }
         }
         
-        // Cleanup temporary files
-        try {
-          if (fs.existsSync(webmFile)) {
-            fs.unlinkSync(webmFile);
-            console.log(`Temporary file ${webmFile} deleted`);
-          }
-          if (fs.existsSync(mp3File)) {
-            fs.unlinkSync(mp3File);
-            console.log(`Temporary file ${mp3File} deleted`);
-          }
-        } catch (cleanupError) {
-          console.error('Error deleting temporary files:', cleanupError);
+        // If we reach here, all transcription attempts failed
+        consecutiveEmptyResponses++;
+        console.log(`All transcription attempts failed. Empty response count: ${consecutiveEmptyResponses}`);
+        
+        if (consecutiveEmptyResponses >= MAX_EMPTY_RESPONSES) {
+          // Too many failures, reset buffer
+          console.log(`Too many empty responses (${consecutiveEmptyResponses}), resetting buffer`);
+          previousAudioBuffer = null;
+          previousAudioBufferSize = 0;
+          consecutiveEmptyResponses = 0;
+        } else {
+          // Keep current buffer for the next attempt
+          previousAudioBuffer = currentBuffer;
+          previousAudioBufferSize = currentBuffer.length;
+          console.log(`Storing audio for next attempt (${previousAudioBufferSize} bytes)`);
         }
+        
+        // Clean up files
+        cleanupFiles([wavFile, mp3File]);
+        
+        // Send empty response
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+          success: true, 
+          transcript: ''
+        }));
         
       } catch (error) {
         console.error('Transcription error:', error.message);
@@ -267,31 +220,58 @@ const server = http.createServer((req, res) => {
   res.end('Not found');
 });
 
-// Convert WebM to MP3 using ffmpeg
-async function convertToMp3(webmFile, mp3File) {
+// Helper to clean up multiple files
+function cleanupFiles(filePaths) {
+  for (const filePath of filePaths) {
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log(`Temporary file ${filePath} deleted`);
+      }
+    } catch (cleanupError) {
+      console.error(`Error deleting file ${filePath}:`, cleanupError);
+    }
+  }
+}
+
+// Convert audio to MP3 using ffmpeg
+async function convertToMp3(inputFile, mp3File) {
   const execAsync = promisify(exec);
   
-  // Make sure input file exists
-  if (!fs.existsSync(webmFile)) {
-    throw new Error(`WebM file ${webmFile} does not exist`);
+  // Check if input file exists
+  if (!fs.existsSync(inputFile)) {
+    throw new Error(`Input file ${inputFile} does not exist`);
   }
   
   // Create ffmpeg command with optimal settings for Whisper
-  const ffmpegCommand = `ffmpeg -y -i "${webmFile}" -c:a libmp3lame -q:a 4 -ar 16000 -ac 1 "${mp3File}"`;
+  const ffmpegCommand = `ffmpeg -y -i "${inputFile}" -c:a libmp3lame -q:a 4 -ar 16000 -ac 1 "${mp3File}"`;
   
-  // Execute command
-  const { stdout, stderr } = await execAsync(ffmpegCommand);
-  
-  if (stderr && !stderr.includes('time=')) {
-    console.error('FFmpeg error output:', stderr);
+  try {
+    console.log(`Running FFmpeg command: ${ffmpegCommand}`);
+    const { stdout, stderr } = await execAsync(ffmpegCommand);
+    
+    if (stderr && !stderr.includes('time=')) {
+      console.log('FFmpeg stderr output:', stderr);
+    }
+    
+    // Check if output file exists and has content
+    if (!fs.existsSync(mp3File)) {
+      throw new Error('MP3 file was not created');
+    }
+    
+    const stats = fs.statSync(mp3File);
+    if (stats.size === 0) {
+      throw new Error('MP3 file is empty');
+    }
+    
+    return true;
+  } catch (error) {
+    // More specific error message
+    if (error.stderr && error.stderr.includes('Invalid data found')) {
+      throw new Error('Invalid audio format: corrupted header or incomplete file');
+    }
+    throw error;
   }
-  
-  // Check if output file exists and has content
-  if (!fs.existsSync(mp3File)) {
-    throw new Error('MP3 file was not created');
-  }
-  
-  return true;
 }
 
 // Use curl to transcribe - more reliable than built-in HTTP clients for this case
@@ -302,6 +282,10 @@ async function transcribeWithCurl(filename) {
   if (!fs.existsSync(filename)) {
     throw new Error(`File ${filename} does not exist`);
   }
+  
+  // Get file size for logging
+  const stats = fs.statSync(filename);
+  console.log(`File size before transcription: ${stats.size} bytes`);
   
   // Escape quotes in the filename for shell safety
   const escapedFilename = filename.replace(/'/g, "'\\''").replace(/"/g, '\\"');
@@ -324,7 +308,8 @@ async function transcribeWithCurl(filename) {
     }
     
     if (!stdout.trim()) {
-      throw new Error('Empty response from API');
+      console.log('Empty response from OpenAI API');
+      return '';
     }
     
     try {
@@ -337,6 +322,9 @@ async function transcribeWithCurl(filename) {
     }
   } catch (error) {
     console.error('Curl execution error:', error);
+    if (error.message.includes('413')) {
+      throw new Error('File too large for API (413 Payload Too Large)');
+    }
     throw new Error(`Failed to transcribe audio: ${error.message}`);
   }
 }
@@ -346,12 +334,13 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`Real-time transcription server running on http://localhost:${PORT}`);
   console.log(`OpenAI API key is configured`);
-  console.log(`Note: This version requires ffmpeg to be installed for MP3 conversion`);
+  console.log(`Note: This version is optimized for WAV audio format`);
+  
   // Check if ffmpeg is available
   exec('ffmpeg -version', (error) => {
     if (error) {
       console.error('WARNING: ffmpeg is not installed or not in PATH');
-      console.error('MP3 conversion will not work, falling back to WebM (less reliable)');
+      console.error('Audio conversion will not work, transcription may fail for non-WAV formats');
     } else {
       console.log('ffmpeg is available for audio conversion');
     }

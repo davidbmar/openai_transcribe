@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Improved Real-Time Transcription</title>
+  <title>WAV-Based Real-Time Transcription</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -80,7 +80,7 @@
   </style>
 </head>
 <body>
-  <h1>Improved Real-Time Transcription</h1>
+  <h1>WAV-Based Real-Time Transcription</h1>
   
   <div class="controls">
     <button id="record-btn">●</button>
@@ -95,7 +95,7 @@
     <h3>Settings</h3>
     <div class="setting-row">
       <label for="chunk-seconds">Send audio every (seconds):</label>
-      <input type="number" id="chunk-seconds" min="6" max="30" value="8">
+      <input type="number" id="chunk-seconds" min="5" max="30" value="8">
     </div>
     <div class="setting-row">
       <label for="min-chunk-size">Minimum chunk size (KB):</label>
@@ -122,17 +122,21 @@
     
     // Variables
     let mediaRecorder;
+    let audioContext;
     let audioStream;
     let isRecording = false;
-    let audioChunks = [];
     let fullTranscript = "";
     let chunkInterval;
     let isProcessing = false;
     let emptyResponseCount = 0;
+    let lastProcessedTime = 0;
+    let scriptProcessorNode;
+    let audioChunks = [];
     
     // Configuration
     const SERVER_URL = 'http://localhost:8080/audio';
     const RESET_URL = 'http://localhost:8080/reset';
+    const SAMPLE_RATE = 16000; // 16kHz is good for speech
     
     // Add to log
     function log(message) {
@@ -180,6 +184,69 @@
         log(`Error: ${error.message}`);
         updateStatus(`Error: ${error.message}`);
       }
+    }
+    
+    // Create WAV file from audio buffer
+    function createWavFile(audioBuffer) {
+      // WAV file format header
+      function createWavHeader(dataLength) {
+        const buffer = new ArrayBuffer(44);
+        const view = new DataView(buffer);
+        
+        // RIFF identifier
+        writeString(view, 0, 'RIFF');
+        // file length minus RIFF identifier length and file description length
+        view.setUint32(4, 36 + dataLength, true);
+        // RIFF type
+        writeString(view, 8, 'WAVE');
+        // format chunk identifier
+        writeString(view, 12, 'fmt ');
+        // format chunk length
+        view.setUint32(16, 16, true);
+        // sample format (1 is PCM)
+        view.setUint16(20, 1, true);
+        // mono (1 channel)
+        view.setUint16(22, 1, true);
+        // sample rate
+        view.setUint32(24, SAMPLE_RATE, true);
+        // byte rate (sample rate * block align)
+        view.setUint32(28, SAMPLE_RATE * 2, true);
+        // block align (channel count * bytes per sample)
+        view.setUint16(32, 2, true);
+        // bits per sample
+        view.setUint16(34, 16, true);
+        // data chunk identifier
+        writeString(view, 36, 'data');
+        // data chunk length
+        view.setUint32(40, dataLength, true);
+        
+        return buffer;
+      }
+      
+      function writeString(view, offset, string) {
+        for (let i = 0; i < string.length; i++) {
+          view.setUint8(offset + i, string.charCodeAt(i));
+        }
+      }
+      
+      // Create the WAV header
+      const headerBuffer = createWavHeader(audioBuffer.length * 2);
+      const header = new Uint8Array(headerBuffer);
+      
+      // Convert audio data to 16-bit PCM
+      const pcmData = new Int16Array(audioBuffer.length);
+      for (let i = 0; i < audioBuffer.length; i++) {
+        // Convert float32 to int16
+        const s = Math.max(-1, Math.min(1, audioBuffer[i]));
+        pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      
+      // Create the final WAV file by combining header and data
+      const wavFile = new Uint8Array(header.length + pcmData.byteLength);
+      wavFile.set(header);
+      wavFile.set(new Uint8Array(pcmData.buffer), header.length);
+      
+      return wavFile;
     }
     
     // Send audio chunk for transcription
@@ -236,21 +303,36 @@
       }
     }
     
-    // Process current audio chunks
+    // Process current audio
     function processAudioChunks() {
       if (audioChunks.length === 0) return;
       
-      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-      log(`Sending chunk: ${bytesToKB(audioBlob.size)}KB`);
-      sendAudioChunk(audioBlob);
-      
-      // Don't clear audio chunks - the server will handle combining them
-      // Only clear if we received a transcript or have too many chunks
-      if (audioChunks.length > 20) {
-        log('Too many chunks stored, clearing some to prevent memory issues');
-        // Keep the last 10 chunks
-        audioChunks = audioChunks.slice(-10);
+      // Only process if we haven't processed in the last 2 seconds
+      const now = Date.now();
+      if (now - lastProcessedTime < 2000) {
+        log('Skipping processing - too soon since last chunk');
+        return;
       }
+      
+      lastProcessedTime = now;
+      
+      // Concatenate all audio chunks
+      const mergedArray = new Float32Array(audioChunks.reduce((acc, chunk) => acc + chunk.length, 0));
+      let offset = 0;
+      for (const chunk of audioChunks) {
+        mergedArray.set(chunk, offset);
+        offset += chunk.length;
+      }
+      
+      // Convert to WAV
+      const wavData = createWavFile(mergedArray);
+      const wavBlob = new Blob([wavData], { type: 'audio/wav' });
+      
+      log(`Sending WAV chunk: ${bytesToKB(wavBlob.size)}KB`);
+      sendAudioChunk(wavBlob);
+      
+      // Clear chunks after sending
+      audioChunks = [];
     }
     
     // Toggle recording
@@ -273,6 +355,7 @@
         transcriptionDiv.innerHTML = '<em>Your transcription will appear here...</em>';
         audioChunks = [];
         emptyResponseCount = 0;
+        lastProcessedTime = 0;
         
         // Reset server buffer
         await resetBuffer();
@@ -286,32 +369,38 @@
         audioStream = await navigator.mediaDevices.getUserMedia({ 
           audio: {
             channelCount: 1,
-            sampleRate: 16000,
             echoCancellation: true,
-            noiseSuppression: true
+            noiseSuppression: true,
+            autoGainControl: true
           }
         });
         
-        // Create recorder
-        try {
-          mediaRecorder = new MediaRecorder(audioStream, {
-            mimeType: 'audio/webm;codecs=opus',
-            audioBitsPerSecond: 16000
-          });
-        } catch (e) {
-          log('Specified format not supported, using default format');
-          mediaRecorder = new MediaRecorder(audioStream);
-        }
+        // Create audio context
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: SAMPLE_RATE
+        });
         
-        // Handle data
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            audioChunks.push(event.data);
+        // Create source node
+        const source = audioContext.createMediaStreamSource(audioStream);
+        
+        // Use ScriptProcessorNode (for broader compatibility)
+        // Note: This is deprecated but has better browser support than AudioWorkletNode
+        scriptProcessorNode = audioContext.createScriptProcessor(4096, 1, 1);
+        scriptProcessorNode.onaudioprocess = (event) => {
+          if (isRecording) {
+            const inputBuffer = event.inputBuffer.getChannelData(0);
+            // Clone the buffer because it gets reused by the browser
+            const bufferCopy = new Float32Array(inputBuffer.length);
+            bufferCopy.set(inputBuffer);
+            audioChunks.push(bufferCopy);
           }
         };
         
+        // Connect the nodes
+        source.connect(scriptProcessorNode);
+        scriptProcessorNode.connect(audioContext.destination);
+        
         // Start recording
-        mediaRecorder.start(500); // Collect data every 500ms
         isRecording = true;
         updateStatus('Recording...');
         
@@ -334,23 +423,28 @@
       // Clear interval
       clearInterval(chunkInterval);
       
-      // Stop recorder
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        mediaRecorder.stop();
-        
-        // Process final chunk after small delay
-        setTimeout(() => {
-          if (audioChunks.length > 0) {
-            processAudioChunks();
-          }
-          updateStatus('Recording stopped');
-        }, 500);
+      // Stop audio context
+      if (scriptProcessorNode) {
+        scriptProcessorNode.disconnect();
+        scriptProcessorNode = null;
+      }
+      
+      if (audioContext && audioContext.state !== 'closed') {
+        audioContext.close().catch(err => console.error('Error closing audio context:', err));
       }
       
       // Stop stream
       if (audioStream) {
         audioStream.getTracks().forEach(track => track.stop());
       }
+      
+      // Process final chunk after small delay
+      setTimeout(() => {
+        if (audioChunks.length > 0) {
+          processAudioChunks();
+        }
+        updateStatus('Recording stopped');
+      }, 500);
       
       // Update UI
       isRecording = false;
