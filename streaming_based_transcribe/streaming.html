@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Improved Real-Time Transcription</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    #record-btn {
+      width: 60px;
+      height: 60px;
+      border-radius: 50%;
+      background-color: #ff4444;
+      color: white;
+      border: none;
+      font-size: 24px;
+      cursor: pointer;
+      margin-bottom: 20px;
+    }
+    #record-btn.recording {
+      animation: pulse 1.5s infinite;
+    }
+    #transcription {
+      border: 1px solid #ccc;
+      padding: 15px;
+      border-radius: 5px;
+      min-height: 100px;
+      background-color: #f9f9f9;
+      margin-top: 20px;
+    }
+    #status {
+      margin: 10px 0;
+      font-weight: bold;
+    }
+    #settings {
+      margin: 20px 0;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+    }
+    .setting-row {
+      margin: 10px 0;
+      display: flex;
+      align-items: center;
+    }
+    .setting-row label {
+      width: 200px;
+    }
+    #log {
+      border: 1px solid #ccc;
+      padding: 10px;
+      height: 150px;
+      overflow-y: auto;
+      font-family: monospace;
+      margin-top: 20px;
+      font-size: 12px;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    #reset-btn {
+      padding: 10px 15px;
+      background-color: #f0f0f0;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7); }
+      70% { box-shadow: 0 0 0 10px rgba(255, 0, 0, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); }
+    }
+  </style>
+</head>
+<body>
+  <h1>Improved Real-Time Transcription</h1>
+  
+  <div class="controls">
+    <button id="record-btn">●</button>
+    <div>
+      <div><strong>Click to start/stop recording</strong></div>
+      <div id="status">Ready</div>
+    </div>
+    <button id="reset-btn">Reset Buffer</button>
+  </div>
+  
+  <div id="settings">
+    <h3>Settings</h3>
+    <div class="setting-row">
+      <label for="chunk-seconds">Send audio every (seconds):</label>
+      <input type="number" id="chunk-seconds" min="6" max="30" value="8">
+    </div>
+    <div class="setting-row">
+      <label for="min-chunk-size">Minimum chunk size (KB):</label>
+      <input type="number" id="min-chunk-size" min="1" max="50" value="5">
+    </div>
+  </div>
+  
+  <div id="transcription">
+    <em>Your transcription will appear here...</em>
+  </div>
+  
+  <h3>Debug Log</h3>
+  <div id="log"></div>
+
+  <script>
+    // DOM elements
+    const recordBtn = document.getElementById('record-btn');
+    const resetBtn = document.getElementById('reset-btn');
+    const statusDiv = document.getElementById('status');
+    const logDiv = document.getElementById('log');
+    const transcriptionDiv = document.getElementById('transcription');
+    const chunkSecondsInput = document.getElementById('chunk-seconds');
+    const minChunkSizeInput = document.getElementById('min-chunk-size');
+    
+    // Variables
+    let mediaRecorder;
+    let audioStream;
+    let isRecording = false;
+    let audioChunks = [];
+    let fullTranscript = "";
+    let chunkInterval;
+    let isProcessing = false;
+    let emptyResponseCount = 0;
+    
+    // Configuration
+    const SERVER_URL = 'http://localhost:8080/audio';
+    const RESET_URL = 'http://localhost:8080/reset';
+    
+    // Add to log
+    function log(message) {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+      logDiv.appendChild(line);
+      logDiv.scrollTop = logDiv.scrollHeight;
+      console.log(message);
+    }
+    
+    // Update status
+    function updateStatus(message) {
+      statusDiv.textContent = message;
+      log(message);
+    }
+    
+    // Add transcript
+    function addTranscript(text) {
+      if (!text || text.trim() === '') return;
+      
+      fullTranscript += " " + text;
+      transcriptionDiv.textContent = fullTranscript.trim();
+    }
+    
+    // Convert bytes to KB for logging
+    function bytesToKB(bytes) {
+      return Math.round(bytes / 1024);
+    }
+    
+    // Reset server audio buffer
+    async function resetBuffer() {
+      try {
+        updateStatus('Resetting audio buffer...');
+        
+        const response = await fetch(RESET_URL, {
+          method: 'POST'
+        });
+        
+        if (response.ok) {
+          updateStatus('Audio buffer reset');
+        } else {
+          updateStatus('Failed to reset buffer');
+        }
+      } catch (error) {
+        log(`Error: ${error.message}`);
+        updateStatus(`Error: ${error.message}`);
+      }
+    }
+    
+    // Send audio chunk for transcription
+    async function sendAudioChunk(audioBlob) {
+      if (isProcessing) {
+        log('Already processing a chunk, skipping this one');
+        return;
+      }
+      
+      const minChunkSizeBytes = parseInt(minChunkSizeInput.value) * 1024;
+      
+      if (audioBlob.size < minChunkSizeBytes) {
+        log(`Chunk too small (${bytesToKB(audioBlob.size)}KB < ${minChunkSizeInput.value}KB), skipping`);
+        return;
+      }
+      
+      isProcessing = true;
+      updateStatus(`Transcribing chunk (${bytesToKB(audioBlob.size)}KB)...`);
+      
+      try {
+        const response = await fetch(SERVER_URL, {
+          method: 'POST',
+          body: audioBlob
+        });
+        
+        if (response.ok) {
+          const result = await response.json();
+          
+          if (result.success && result.transcript && result.transcript.trim() !== '') {
+            updateStatus('Transcription received');
+            addTranscript(result.transcript);
+            emptyResponseCount = 0;
+          } else {
+            emptyResponseCount++;
+            updateStatus(`No transcription received (${emptyResponseCount})`);
+            
+            // If we get too many empty responses, reset buffer
+            if (emptyResponseCount >= 5) {
+              log('Too many empty responses, resetting buffer');
+              await resetBuffer();
+              emptyResponseCount = 0;
+            }
+          }
+        } else {
+          const errorText = await response.text();
+          log(`Server error: ${response.status} - ${errorText}`);
+          updateStatus(`Error: ${response.status}`);
+        }
+      } catch (error) {
+        log(`Error: ${error.message}`);
+        updateStatus(`Error: ${error.message}`);
+      } finally {
+        isProcessing = false;
+      }
+    }
+    
+    // Process current audio chunks
+    function processAudioChunks() {
+      if (audioChunks.length === 0) return;
+      
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      log(`Sending chunk: ${bytesToKB(audioBlob.size)}KB`);
+      sendAudioChunk(audioBlob);
+      
+      // Don't clear audio chunks - the server will handle combining them
+      // Only clear if we received a transcript or have too many chunks
+      if (audioChunks.length > 20) {
+        log('Too many chunks stored, clearing some to prevent memory issues');
+        // Keep the last 10 chunks
+        audioChunks = audioChunks.slice(-10);
+      }
+    }
+    
+    // Toggle recording
+    recordBtn.addEventListener('click', () => {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    });
+    
+    // Reset buffer button
+    resetBtn.addEventListener('click', resetBuffer);
+    
+    // Start recording
+    async function startRecording() {
+      try {
+        // Reset
+        fullTranscript = "";
+        transcriptionDiv.innerHTML = '<em>Your transcription will appear here...</em>';
+        audioChunks = [];
+        emptyResponseCount = 0;
+        
+        // Reset server buffer
+        await resetBuffer();
+        
+        // Disable settings during recording
+        chunkSecondsInput.disabled = true;
+        minChunkSizeInput.disabled = true;
+        
+        // Get mic access
+        updateStatus('Requesting microphone access...');
+        audioStream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true
+          }
+        });
+        
+        // Create recorder
+        try {
+          mediaRecorder = new MediaRecorder(audioStream, {
+            mimeType: 'audio/webm;codecs=opus',
+            audioBitsPerSecond: 16000
+          });
+        } catch (e) {
+          log('Specified format not supported, using default format');
+          mediaRecorder = new MediaRecorder(audioStream);
+        }
+        
+        // Handle data
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
+          }
+        };
+        
+        // Start recording
+        mediaRecorder.start(500); // Collect data every 500ms
+        isRecording = true;
+        updateStatus('Recording...');
+        
+        // Set up chunk processing interval
+        const chunkSeconds = parseInt(chunkSecondsInput.value);
+        log(`Will send chunks every ${chunkSeconds} seconds`);
+        
+        chunkInterval = setInterval(processAudioChunks, chunkSeconds * 1000);
+        
+        // Update UI
+        recordBtn.textContent = '■';
+        recordBtn.classList.add('recording');
+      } catch (error) {
+        updateStatus(`Error: ${error.message}`);
+      }
+    }
+    
+    // Stop recording
+    function stopRecording() {
+      // Clear interval
+      clearInterval(chunkInterval);
+      
+      // Stop recorder
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+        
+        // Process final chunk after small delay
+        setTimeout(() => {
+          if (audioChunks.length > 0) {
+            processAudioChunks();
+          }
+          updateStatus('Recording stopped');
+        }, 500);
+      }
+      
+      // Stop stream
+      if (audioStream) {
+        audioStream.getTracks().forEach(track => track.stop());
+      }
+      
+      // Update UI
+      isRecording = false;
+      recordBtn.textContent = '●';
+      recordBtn.classList.remove('recording');
+      
+      // Re-enable settings
+      chunkSecondsInput.disabled = false;
+      minChunkSizeInput.disabled = false;
+    }
+    
+    // Ensure cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      if (isRecording) {
+        stopRecording();
+      }
+    });
+  </script>
+</body>
+</html>
