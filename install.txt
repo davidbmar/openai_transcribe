@@ -1,0 +1,7 @@
+npm install ws
+npm install node-fetch form-data
+npm install axios form-data
+
+
+
+

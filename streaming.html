@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Audio Streaming via HTTP</title>
+  <title>Audio Transcription Demo</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -24,35 +24,88 @@
     }
     #log {
       margin-top: 20px;
-      height: 200px;
+      height: 150px;
       overflow-y: auto;
       border: 1px solid #ccc;
       padding: 10px;
       font-family: monospace;
+      font-size: 12px;
+    }
+    #transcription {
+      margin-top: 20px;
+      border: 1px solid #ccc;
+      padding: 15px;
+      border-radius: 5px;
+      min-height: 100px;
+      background-color: #f9f9f9;
+    }
+    .transcript-line {
+      margin-bottom: 8px;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .record-button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 50px;
+      height: 50px;
+      border-radius: 50%;
+      background-color: #ff4444;
+      color: white;
+      border: none;
+      cursor: pointer;
+    }
+    .record-button.recording {
+      animation: pulse 1.5s infinite;
+    }
+    .record-button:disabled {
+      background-color: #cccccc;
+      cursor: not-allowed;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7); }
+      70% { box-shadow: 0 0 0 10px rgba(255, 0, 0, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); }
     }
   </style>
 </head>
 <body>
-  <h1>Audio Streaming via HTTP</h1>
-  <div>
-    <button id="startBtn">Start Recording</button>
-    <button id="stopBtn" disabled>Stop Recording</button>
+  <h1>Audio Transcription Demo</h1>
+  
+  <div class="controls">
+    <button id="startBtn" class="record-button">●</button>
+    <div>
+      <div><strong>Click to start/stop recording</strong></div>
+      <div id="status">Status: Ready</div>
+    </div>
   </div>
-  <div id="status">Status: Ready</div>
+  
+  <h2>Transcription</h2>
+  <div id="transcription">
+    <em>Your transcription will appear here...</em>
+  </div>
+  
+  <h3>Debug Log</h3>
   <div id="log"></div>
 
   <script>
     // DOM elements
     const startBtn = document.getElementById('startBtn');
-    const stopBtn = document.getElementById('stopBtn');
     const statusDiv = document.getElementById('status');
     const logDiv = document.getElementById('log');
+    const transcriptionDiv = document.getElementById('transcription');
     
     // Variables
     let mediaRecorder;
     let audioStream;
     let isRecording = false;
+    let recordingTimeout = null;
     let chunkCount = 0;
+    let fullTranscript = "";
     
     // Server URL
     const SERVER_URL = 'http://localhost:8080/audio';
@@ -72,9 +125,41 @@
       log(message);
     }
     
-    // Send audio data to server
+    // Add transcript
+    function addTranscript(text) {
+      if (!text || text.trim() === '') return;
+      
+      // Add to full transcript
+      fullTranscript += " " + text;
+      
+      // Update the UI
+      transcriptionDiv.innerHTML = '';
+      const lines = fullTranscript.trim().split(/[.!?]\s+/);
+      
+      lines.forEach(line => {
+        if (line.trim() !== '') {
+          const lineElement = document.createElement('div');
+          lineElement.className = 'transcript-line';
+          lineElement.textContent = line.trim() + '.';
+          transcriptionDiv.appendChild(lineElement);
+        }
+      });
+      
+      // Scroll to the bottom
+      transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
+    }
+    
+    // Clear transcript
+    function clearTranscript() {
+      fullTranscript = "";
+      transcriptionDiv.innerHTML = '<em>Your transcription will appear here...</em>';
+    }
+    
+    // Send audio data to server for transcription
     async function sendAudioData(audioBlob) {
       try {
+        updateStatus(`Sending audio for transcription...`);
+        
         const response = await fetch(SERVER_URL, {
           method: 'POST',
           body: audioBlob
@@ -82,23 +167,44 @@
         
         if (response.ok) {
           const result = await response.json();
-          updateStatus(`Server received chunk #${chunkCount}: ${result.size} bytes`);
+          
+          if (result.success && result.transcript) {
+            updateStatus(`Transcription received`);
+            addTranscript(result.transcript);
+          } else {
+            updateStatus(`Transcription failed: ${result.error || 'Unknown error'}`);
+          }
+          
           return true;
         } else {
           log(`Server error: ${response.status} ${response.statusText}`);
+          updateStatus(`Server error: ${response.status}`);
           return false;
         }
       } catch (error) {
         log(`Error sending data: ${error.message}`);
+        updateStatus(`Error: ${error.message}`);
         return false;
       }
     }
     
+    // Toggle recording
+    startBtn.addEventListener('click', () => {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    });
+    
     // Start recording
-    startBtn.addEventListener('click', async () => {
+    async function startRecording() {
       try {
-        // Reset counters
+        // Reset for new recording
         chunkCount = 0;
+        
+        // Clear previous transcript if it exists
+        clearTranscript();
         
         // Get user media
         updateStatus('Requesting microphone access...');
@@ -118,43 +224,64 @@
         try {
           mediaRecorder = new MediaRecorder(audioStream, options);
         } catch (e) {
-          // Fallback if the specified format is not supported
           updateStatus(`Specified format not supported, using default format`);
           mediaRecorder = new MediaRecorder(audioStream);
         }
         
-        mediaRecorder.ondataavailable = async (event) => {
-          if (event.data.size > 0 && isRecording) {
-            chunkCount++;
-            updateStatus(`Processing chunk #${chunkCount} (${event.data.size} bytes)`);
-            await sendAudioData(event.data);
+        // Set up auto-stop after 2 minutes to avoid very large files
+        const MAX_RECORDING_TIME = 2 * 60 * 1000; // 2 minutes
+        recordingTimeout = setTimeout(() => {
+          if (isRecording) {
+            updateStatus('Maximum recording time reached');
+            stopRecording();
+          }
+        }, MAX_RECORDING_TIME);
+        
+        // Data handling
+        let audioChunks = [];
+        
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
           }
         };
         
-        // Start recording with small chunks (200ms)
+        mediaRecorder.onstop = async () => {
+          // Combine all audio chunks
+          const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+          
+          // Send for transcription
+          await sendAudioData(audioBlob);
+          
+          // Reset
+          audioChunks = [];
+        };
+        
+        // Start recording
         isRecording = true;
-        mediaRecorder.start(200);
+        mediaRecorder.start();
         updateStatus('Recording started');
         
-        // Update buttons
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
+        // Update UI
+        startBtn.classList.add('recording');
+        startBtn.textContent = '■';
       } catch (error) {
         updateStatus(`Error: ${error.message}`);
       }
-    });
+    }
     
     // Stop recording
-    stopBtn.addEventListener('click', () => {
-      stopRecording();
-    });
-    
     function stopRecording() {
+      // Clear the auto-stop timeout
+      if (recordingTimeout) {
+        clearTimeout(recordingTimeout);
+        recordingTimeout = null;
+      }
+      
       // Stop media recorder
       if (mediaRecorder && mediaRecorder.state !== 'inactive') {
         mediaRecorder.stop();
-        isRecording = false;
-        updateStatus('Recording stopped');
+        updateStatus('Recording stopped, processing...');
       }
       
       // Stop audio stream
@@ -162,13 +289,18 @@
         audioStream.getTracks().forEach(track => track.stop());
       }
       
-      // Update buttons
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
+      // Update UI
+      isRecording = false;
+      startBtn.classList.remove('recording');
+      startBtn.textContent = '●';
     }
     
     // Ensure cleanup on page unload
-    window.addEventListener('beforeunload', stopRecording);
+    window.addEventListener('beforeunload', () => {
+      if (isRecording) {
+        stopRecording();
+      }
+    });
   </script>
 </body>
 </html>
