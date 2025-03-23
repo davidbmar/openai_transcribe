@@ -2,68 +2,173 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Audio Streaming Demo (Fixed)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Audio Streaming via HTTP</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    button {
+      padding: 10px 15px;
+      margin: 5px;
+      font-size: 16px;
+    }
+    #status {
+      margin-top: 20px;
+      padding: 10px;
+      background-color: #f0f0f0;
+      border-radius: 5px;
+    }
+    #log {
+      margin-top: 20px;
+      height: 200px;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      padding: 10px;
+      font-family: monospace;
+    }
+  </style>
 </head>
 <body>
-  <h1>Audio Streaming Demo</h1>
-  <button id="start">Start Streaming</button>
-  <button id="stop" disabled>Stop Streaming</button>
+  <h1>Audio Streaming via HTTP</h1>
+  <div>
+    <button id="startBtn">Start Recording</button>
+    <button id="stopBtn" disabled>Stop Recording</button>
+  </div>
+  <div id="status">Status: Ready</div>
+  <div id="log"></div>
 
-  <!-- websocket-stream from CDN -->
-  <script src="https://bundle.run/websocket-stream@5.5.2"></script>
   <script>
+    // DOM elements
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusDiv = document.getElementById('status');
+    const logDiv = document.getElementById('log');
+    
+    // Variables
     let mediaRecorder;
-    let socketStream;
-    const startButton = document.getElementById('start');
-    const stopButton = document.getElementById('stop');
-
-    startButton.onclick = async () => {
+    let audioStream;
+    let isRecording = false;
+    let chunkCount = 0;
+    
+    // Server URL
+    const SERVER_URL = 'http://localhost:8080/audio';
+    
+    // Log function
+    function log(message) {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+      logDiv.appendChild(line);
+      logDiv.scrollTop = logDiv.scrollHeight; // Auto-scroll
+      console.log(message);
+    }
+    
+    // Update status
+    function updateStatus(message) {
+      statusDiv.textContent = `Status: ${message}`;
+      log(message);
+    }
+    
+    // Send audio data to server
+    async function sendAudioData(audioBlob) {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-        // websocket-stream with explicit no compression
-        socketStream = websocketStream('ws://localhost:8080', {
-          perMessageDeflate: false
+        const response = await fetch(SERVER_URL, {
+          method: 'POST',
+          body: audioBlob
         });
-
-        socketStream.on('open', () => {
-          console.log('WebSocket connection established (no compression)');
-
-          mediaRecorder = new MediaRecorder(stream);
-          mediaRecorder.ondataavailable = async (event) => {
-            if (event.data.size > 0) {
-              const arrayBuffer = await event.data.arrayBuffer();
-              socketStream.write(new Uint8Array(arrayBuffer));
-            }
-          };
-          mediaRecorder.start(250);
-          startButton.disabled = true;
-          stopButton.disabled = false;
-        });
-
-        socketStream.on('error', (error) => {
-          console.error('WebSocket stream error:', error);
-        });
-
-        socketStream.on('close', () => {
-          console.log('WebSocket stream closed');
-        });
-      } catch (err) {
-        console.error('Error accessing audio stream:', err);
+        
+        if (response.ok) {
+          const result = await response.json();
+          updateStatus(`Server received chunk #${chunkCount}: ${result.size} bytes`);
+          return true;
+        } else {
+          log(`Server error: ${response.status} ${response.statusText}`);
+          return false;
+        }
+      } catch (error) {
+        log(`Error sending data: ${error.message}`);
+        return false;
       }
-    };
-
-    stopButton.onclick = () => {
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    }
+    
+    // Start recording
+    startBtn.addEventListener('click', async () => {
+      try {
+        // Reset counters
+        chunkCount = 0;
+        
+        // Get user media
+        updateStatus('Requesting microphone access...');
+        audioStream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000
+          }
+        });
+        updateStatus('Microphone access granted');
+        
+        // Create media recorder
+        const options = {
+          mimeType: 'audio/webm;codecs=opus'
+        };
+        
+        try {
+          mediaRecorder = new MediaRecorder(audioStream, options);
+        } catch (e) {
+          // Fallback if the specified format is not supported
+          updateStatus(`Specified format not supported, using default format`);
+          mediaRecorder = new MediaRecorder(audioStream);
+        }
+        
+        mediaRecorder.ondataavailable = async (event) => {
+          if (event.data.size > 0 && isRecording) {
+            chunkCount++;
+            updateStatus(`Processing chunk #${chunkCount} (${event.data.size} bytes)`);
+            await sendAudioData(event.data);
+          }
+        };
+        
+        // Start recording with small chunks (200ms)
+        isRecording = true;
+        mediaRecorder.start(200);
+        updateStatus('Recording started');
+        
+        // Update buttons
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      } catch (error) {
+        updateStatus(`Error: ${error.message}`);
+      }
+    });
+    
+    // Stop recording
+    stopBtn.addEventListener('click', () => {
+      stopRecording();
+    });
+    
+    function stopRecording() {
+      // Stop media recorder
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
         mediaRecorder.stop();
+        isRecording = false;
+        updateStatus('Recording stopped');
       }
-      if (socketStream) {
-        socketStream.end();
+      
+      // Stop audio stream
+      if (audioStream) {
+        audioStream.getTracks().forEach(track => track.stop());
       }
-      startButton.disabled = false;
-      stopButton.disabled = true;
-    };
+      
+      // Update buttons
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+    
+    // Ensure cleanup on page unload
+    window.addEventListener('beforeunload', stopRecording);
   </script>
 </body>
 </html>
-
