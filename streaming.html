@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Audio Streaming Demo (Fixed)</title>
+</head>
+<body>
+  <h1>Audio Streaming Demo</h1>
+  <button id="start">Start Streaming</button>
+  <button id="stop" disabled>Stop Streaming</button>
+
+  <!-- websocket-stream from CDN -->
+  <script src="https://bundle.run/websocket-stream@5.5.2"></script>
+  <script>
+    let mediaRecorder;
+    let socketStream;
+    const startButton = document.getElementById('start');
+    const stopButton = document.getElementById('stop');
+
+    startButton.onclick = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // websocket-stream with explicit no compression
+        socketStream = websocketStream('ws://localhost:8080', {
+          perMessageDeflate: false
+        });
+
+        socketStream.on('open', () => {
+          console.log('WebSocket connection established (no compression)');
+
+          mediaRecorder = new MediaRecorder(stream);
+          mediaRecorder.ondataavailable = async (event) => {
+            if (event.data.size > 0) {
+              const arrayBuffer = await event.data.arrayBuffer();
+              socketStream.write(new Uint8Array(arrayBuffer));
+            }
+          };
+          mediaRecorder.start(250);
+          startButton.disabled = true;
+          stopButton.disabled = false;
+        });
+
+        socketStream.on('error', (error) => {
+          console.error('WebSocket stream error:', error);
+        });
+
+        socketStream.on('close', () => {
+          console.log('WebSocket stream closed');
+        });
+      } catch (err) {
+        console.error('Error accessing audio stream:', err);
+      }
+    };
+
+    stopButton.onclick = () => {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      if (socketStream) {
+        socketStream.end();
+      }
+      startButton.disabled = false;
+      stopButton.disabled = true;
+    };
+  </script>
+</body>
+</html>
+
